@@ -10,6 +10,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # Optional providers
 ANTHROPIC_AVAILABLE = False
 OPENAI_AVAILABLE = False
+GOOGLE_AVAILABLE = False
 
 try:
     import anthropic  # type: ignore
@@ -20,6 +21,12 @@ except Exception:
 try:
     from openai import OpenAI  # type: ignore
     OPENAI_AVAILABLE = True
+except Exception:
+    pass
+
+try:
+    from google import genai  # type: ignore
+    GOOGLE_AVAILABLE = True
 except Exception:
     pass
 
@@ -153,20 +160,24 @@ def render_pdf_first_pages_to_png_b64(pdf_path: str, max_pages: int = 5, dpi: in
 
 def choose_provider_env(provider: Optional[str]) -> str:
     p = (provider or "").strip().lower()
-    if p in {"anthropic", "openai"}:
-        return p
+    if p in {"anthropic", "openai", "google", "gemini"}:
+        return "google" if p == "gemini" else p
     # Auto-detect by env
+    if os.getenv("GOOGLE_API_KEY") and GOOGLE_AVAILABLE:
+        return "google"
     if os.getenv("ANTHROPIC_API_KEY") and ANTHROPIC_AVAILABLE:
         return "anthropic"
     if os.getenv("OPENAI_API_KEY") and OPENAI_AVAILABLE:
         return "openai"
     # Fallback preference
+    if GOOGLE_AVAILABLE:
+        return "google"
     if ANTHROPIC_AVAILABLE:
         return "anthropic"
     if OPENAI_AVAILABLE:
         return "openai"
     raise RuntimeError(
-        "No supported provider available. Install and set ANTHROPIC_API_KEY or OPENAI_API_KEY."
+        "No supported provider available. Install google-genai and set GOOGLE_API_KEY, or set ANTHROPIC_API_KEY / OPENAI_API_KEY."
     )
 
 
@@ -241,6 +252,54 @@ async def call_openai(images_b64: List[str], model: Optional[str]) -> str:
     return output_text.strip()
 
 
+async def call_gemini(images_b64: List[str], model: Optional[str]) -> str:
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY is not set")
+    client = genai.Client(api_key=api_key)
+
+    chosen_model = model or os.getenv("ACORD25_GOOGLE_MODEL", "gemini-2.5-flash-lite")
+
+    # Build one user turn with prompt + multiple inline images
+    contents = [
+        {
+            "role": "user",
+            "parts": [
+                {"text": PROMPT},
+                *[
+                    {"inline_data": {"mime_type": "image/png", "data": img_b64}}
+                    for img_b64 in images_b64
+                ],
+            ],
+        }
+    ]
+
+    def _call():
+        return client.models.generate_content(model=chosen_model, contents=contents)
+
+    resp = await asyncio.to_thread(_call)
+
+    # New google-genai responses often have .text with concatenated segments
+    output_text = getattr(resp, "text", None)
+    if not output_text:
+        # Fallback: try to reconstruct from candidates if present
+        try:
+            cands = getattr(resp, "candidates", []) or []
+            parts = []
+            for c in cands:
+                content = getattr(c, "content", None)
+                if content and getattr(content, "parts", None):
+                    for part in content.parts:
+                        t = getattr(part, "text", None)
+                        if t:
+                            parts.append(t)
+            output_text = "\n".join(parts)
+        except Exception:
+            output_text = ""
+
+    return (output_text or "").strip()
+
+
 def extract_json_or_null(raw_text: str) -> str:
     t = raw_text.strip()
     # Allow literal null (case-insensitive trim)
@@ -277,19 +336,21 @@ async def extract_acord25_from_pdf(
     Args:
         pdf_path: Absolute path to the PDF file accessible by the server.
         max_pages: Max pages from the start of the PDF to include (default 5).
-        provider: 'anthropic' or 'openai'. If omitted, auto-detect from env.
+        provider: 'anthropic', 'openai', or 'google'/'gemini'. If omitted, auto-detect from env.
         model: Optional model override for the chosen provider.
 
     Returns:
         A string containing either a JSON object or the literal `null`.
     """
-    images_b64 = render_pdf_first_pages_to_png_b64(pdf_path, max_pages=max_pages)
+    images_b64 = await asyncio.to_thread(render_pdf_first_pages_to_png_b64, pdf_path, max_pages)
     chosen = choose_provider_env(provider)
 
     if chosen == "anthropic":
         raw = await call_anthropic(images_b64, model=model)
     elif chosen == "openai":
         raw = await call_openai(images_b64, model=model)
+    elif chosen == "google":
+        raw = await call_gemini(images_b64, model=model)
     else:
         raise RuntimeError(f"Unsupported provider: {chosen}")
 
