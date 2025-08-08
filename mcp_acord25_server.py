@@ -33,6 +33,10 @@ except Exception:
 
 SERVER_NAME = "ACORD25 PDF -> JSON (Vision)"
 
+# Concurrency control
+MAX_CONCURRENCY = int(os.getenv("ACORD25_MAX_CONCURRENCY", "100"))
+REQUEST_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENCY)
+
 PROMPT = (
     "CRITICAL VALIDATION: \n\n"
     "Your FIRST task is to determine if the provided document is a genuine ACORD 25 Certificate of Liability Insurance (COI) form. \n\n"
@@ -153,6 +157,43 @@ def render_pdf_first_pages_to_png_b64(pdf_path: str, max_pages: int = 5, dpi: in
             images_b64.append(base64.b64encode(png_bytes).decode("ascii"))
     finally:
         doc.close()
+    if not images_b64:
+        raise ValueError("No pages rendered from PDF")
+    return images_b64
+
+
+async def render_pdf_first_pages_to_png_b64_async(
+    pdf_path: str, max_pages: int = 5, dpi: int = 150
+) -> List[str]:
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    if max_pages <= 0:
+        raise ValueError("max_pages must be >= 1")
+
+    # Determine number of pages first
+    doc = fitz.open(pdf_path)
+    try:
+        num_pages = min(len(doc), max_pages)
+    finally:
+        doc.close()
+
+    async def render_one(page_index: int) -> str:
+        def _work() -> str:
+            d = fitz.open(pdf_path)
+            try:
+                page = d.load_page(page_index)
+                zoom = dpi / 72.0
+                mat = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                png_bytes = pix.tobytes("png")
+                return base64.b64encode(png_bytes).decode("ascii")
+            finally:
+                d.close()
+
+        return await asyncio.to_thread(_work)
+
+    tasks = [render_one(i) for i in range(num_pages)]
+    images_b64 = await asyncio.gather(*tasks)
     if not images_b64:
         raise ValueError("No pages rendered from PDF")
     return images_b64
@@ -330,6 +371,7 @@ async def extract_acord25_from_pdf(
     max_pages: int = 5,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    dpi: int = 150,
 ) -> str:
     """Process a PDF (first N pages) through a vision LLM and return ONLY JSON or null.
 
@@ -338,23 +380,27 @@ async def extract_acord25_from_pdf(
         max_pages: Max pages from the start of the PDF to include (default 5).
         provider: 'anthropic', 'openai', or 'google'/'gemini'. If omitted, auto-detect from env.
         model: Optional model override for the chosen provider.
+        dpi: Render DPI for page images (default 150). Lower = smaller payload.
 
     Returns:
         A string containing either a JSON object or the literal `null`.
     """
-    images_b64 = await asyncio.to_thread(render_pdf_first_pages_to_png_b64, pdf_path, max_pages)
-    chosen = choose_provider_env(provider)
+    async with REQUEST_SEMAPHORE:
+        images_b64 = await render_pdf_first_pages_to_png_b64_async(
+            pdf_path, max_pages=max_pages, dpi=dpi
+        )
+        chosen = choose_provider_env(provider)
 
-    if chosen == "anthropic":
-        raw = await call_anthropic(images_b64, model=model)
-    elif chosen == "openai":
-        raw = await call_openai(images_b64, model=model)
-    elif chosen == "google":
-        raw = await call_gemini(images_b64, model=model)
-    else:
-        raise RuntimeError(f"Unsupported provider: {chosen}")
+        if chosen == "anthropic":
+            raw = await call_anthropic(images_b64, model=model)
+        elif chosen == "openai":
+            raw = await call_openai(images_b64, model=model)
+        elif chosen == "google":
+            raw = await call_gemini(images_b64, model=model)
+        else:
+            raise RuntimeError(f"Unsupported provider: {chosen}")
 
-    return extract_json_or_null(raw)
+        return extract_json_or_null(raw)
 
 
 if __name__ == "__main__":

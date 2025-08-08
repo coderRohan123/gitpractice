@@ -25,6 +25,10 @@ Optional model overrides:
 - `ACORD25_ANTHROPIC_MODEL` (default: `claude-3-5-sonnet-latest`)
 - `ACORD25_OPENAI_MODEL` (default: `gpt-4o`)
 
+Optional performance settings:
+
+- `ACORD25_MAX_CONCURRENCY` (default `100`): max concurrent requests guarded by semaphore.
+
 ## Run (as MCP server over stdio)
 
 ```bash
@@ -40,7 +44,8 @@ Client config example (Cursor `mcp.json` style):
       "command": "python",
       "args": ["/workspace/mcp_acord25_server.py"],
       "env": {
-        "GOOGLE_API_KEY": "${GOOGLE_API_KEY}"
+        "GOOGLE_API_KEY": "${GOOGLE_API_KEY}",
+        "ACORD25_MAX_CONCURRENCY": "100"
       }
     }
   }
@@ -49,16 +54,18 @@ Client config example (Cursor `mcp.json` style):
 
 ## Tool
 
-- `extract_acord25_from_pdf(pdf_path: str, max_pages: int = 5, provider?: "google"|"gemini"|"anthropic"|"openai", model?: str) -> string`
+- `extract_acord25_from_pdf(pdf_path: str, max_pages: int = 5, provider?: "google"|"gemini"|"anthropic"|"openai", model?: str, dpi: int = 150) -> string`
   - Returns a string that is either a JSON object or the literal `null`.
+  - `dpi` controls PNG render resolution. Lower values reduce payload size and latency; 150 is a good balance.
 
 ## Concurrency
 
-- The tool is fully async and offloads blocking tasks (PDF rendering and model calls) to threads, allowing high concurrency.
-- With reasonable CPU and IO, handling ~100 concurrent requests is supported. Scale CPU/memory and tune worker limits as needed.
+- Fully async; blocking PDF rendering and model calls are offloaded to threads.
+- Per-page rendering is parallelized for speed.
+- With sufficient resources, ~100 concurrent requests is supported; tune `ACORD25_MAX_CONCURRENCY` as needed.
 
 ## Notes
 
-- PDF pages are rendered to PNG at 180 DPI for reliable OCR/vision quality.
+- PDF pages are rendered to PNG at configurable DPI (default 150).
 - The server enforces output to be strict JSON or `null`.
 - Provider auto-detection prefers Gemini if `GOOGLE_API_KEY` is set.
